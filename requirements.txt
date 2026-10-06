@@ -1,0 +1,9 @@
+nflreadpy>=0.1.5
+polars>=1.20
+pandas>=2.2.2
+pyarrow>=17
+numpy>=1.26
+scipy>=1.11
+requests>=2.32
+matplotlib>=3.9.3
+pytest>=8.0

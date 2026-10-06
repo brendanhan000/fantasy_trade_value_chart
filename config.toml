@@ -1,0 +1,216 @@
+# League + model config. Every tunable lives here; code has no magic numbers
+# that you'd want to change per league.
+
+[league]
+platform = "ESPN"
+teams = 10
+season = 0             # 0 = current nflverse season
+last_week = 17         # final fantasy week (ESPN 10-team playoffs: 15-17)
+horizon_years = 0      # T. 0 = redraft. 1+ = keeper/dynasty (enables layer 4)
+
+[lineup]               # K and DST are excluded from the chart
+QB = 1
+RB = 2
+WR = 2
+TE = 1
+FLEX = 1
+flex_eligible = ["RB", "WR", "TE"]
+
+# Keys are nflverse player_stats column names, so scoring is a dot product.
+[scoring]
+passing_yards = 0.04
+passing_tds = 4
+passing_interceptions = -2
+passing_2pt_conversions = 2
+rushing_yards = 0.1
+rushing_tds = 6
+rushing_2pt_conversions = 2
+receptions = 1
+receiving_yards = 0.1
+receiving_tds = 6
+receiving_2pt_conversions = 2
+fumbles_lost = -2      # UNVERIFIED for this league - check ESPN settings
+
+# Per-game yardage bonuses: [low, high, points], earned when low <= Y < high.
+[scoring.milestones]
+passing_yards = [[300, 400, 1], [400, inf, 2]]
+rushing_yards = [[100, 200, 1], [200, inf, 2]]
+receiving_yards = [[100, 200, 1], [200, inf, 2]]
+
+# Long-TD bonuses: [min_length, points].
+# stack = true:  a 55-yd TD earns 1 + 1.5 = 2.5
+# stack = false: a 55-yd TD earns 1.5 only
+[scoring.long_td]
+stack = true
+rushing = [[40, 1], [50, 1.5]]
+receiving = [[40, 1], [50, 1.5]]
+
+[projection]
+recency_decay = 0.85   # weight of a game n weeks ago = decay^n
+prior_games = 4        # last season counts as at most this many games of evidence
+min_weight = 0.5       # players with less total game weight are dropped (logged)
+
+[layer1]
+b1 = 0.65              # weight on stat-line projection
+b2 = 0.35              # weight on opportunity x efficiency x environment
+sos_strength = 0.5     # 0 = ignore matchups, 1 = full points-allowed ratio
+sos_prior_games = 4    # shrink each defense's ratio toward 1.0
+f_scale = 0.08         # efficiency multiplier per 1 z of the blend
+f_cap = 0.25
+e_scale = 0.05         # environment multiplier per 1 z of the blend
+e_cap = 0.15
+coach_change_prior_mult = 0.5   # new head coach -> trust last season's team data less
+milestone_sigma_k = 5  # games of shrinkage toward the position's log-sd
+long_td_prior_tds = 4  # TDs of shrinkage toward the explosive-rate prior
+
+# Reference pool per position: the OFE term is scaled to this pool's mean projection.
+[layer1.ref_pool]
+QB = 12
+RB = 24
+WR = 30
+TE = 12
+
+# O: weighted blend of usage, each normalized to the reference pool (1.0 = typical starter).
+[layer1.opportunity.QB]
+snap_share = 0.4
+carry_share = 0.3
+rz_touches = 0.15
+gl_touches = 0.15
+[layer1.opportunity.RB]
+snap_share = 0.15
+target_share = 0.2
+carry_share = 0.35
+rz_touches = 0.15
+gl_touches = 0.15
+[layer1.opportunity.WR]
+snap_share = 0.15
+target_share = 0.4
+air_yards_share = 0.25
+rz_touches = 0.15
+gl_touches = 0.05
+[layer1.opportunity.TE]
+snap_share = 0.2
+target_share = 0.4
+air_yards_share = 0.15
+rz_touches = 0.15
+gl_touches = 0.1
+
+# F: weighted blend of within-position z-scores. yprr uses snaps x team pass rate as routes.
+[layer1.efficiency.QB]
+epa_per_dropback = 0.6
+cpoe = 0.4
+[layer1.efficiency.RB]
+yac_per_carry = 0.3
+epa_per_carry = 0.3
+yprr = 0.25
+croe = 0.15
+[layer1.efficiency.WR]
+yprr = 0.5
+epa_per_target = 0.3
+croe = 0.2
+[layer1.efficiency.TE]
+yprr = 0.5
+epa_per_target = 0.3
+croe = 0.2
+
+# E: weighted blend of team z-scores (negative weight = hurts). Normalized by sum of |w|.
+[layer1.environment.QB]
+implied_total = 0.4
+proe = 0.25
+pace = 0.2
+ol_quality = 0.15
+[layer1.environment.RB]
+implied_total = 0.4
+proe = -0.1
+pace = 0.2
+qb_quality = 0.1
+ol_quality = 0.2
+[layer1.environment.WR]
+implied_total = 0.35
+proe = 0.25
+pace = 0.15
+qb_quality = 0.2
+ol_quality = 0.05
+[layer1.environment.TE]
+implied_total = 0.35
+proe = 0.25
+pace = 0.15
+qb_quality = 0.2
+ol_quality = 0.05
+
+[layer2]
+lambda = 0.05          # penalty per point of weekly std dev (keep small)
+g1 = 1.5               # points per unit boom rate
+g2 = 1.5               # points per unit bust rate
+boom_rank = 12
+bust_rank = 36
+availability_prior = 0.92
+availability_prior_games = 8
+sigma_prior_games = 6
+
+# Sleeper injury_status -> [play probability, number of weeks it applies]
+[layer2.status]
+Questionable = [0.8, 1]
+Doubtful = [0.2, 1]
+Out = [0.0, 1]
+Sus = [0.0, 1]
+IR = [0.0, 4]
+PUP = [0.0, 4]
+
+# Role security r by depth-chart rank (index 0 = 1st string; last value repeats).
+[layer2.depth]
+QB = [1.0, 0.85, 0.8]
+RB = [1.0, 0.95, 0.85]
+WR = [1.0, 1.0, 1.0, 0.92, 0.85]
+TE = [1.0, 0.92, 0.85]
+draft_round_bonus = [0.05, 0.03, 0.01]   # rounds 1-3; r is capped at 1.0
+
+[layer3]
+flex = 10
+starter_weight = 0.5   # R = w * starter-level + (1 - w) * waiver-level
+scarcity_exp = 0.25    # S_pos = (dropoff_pos / mean dropoff)^exp; 0 disables
+[layer3.starters]
+QB = 10
+RB = 20
+WR = 20
+TE = 10
+[layer3.waiver_rank]
+QB = 15
+RB = 35
+WR = 40
+TE = 14
+[layer3.week_weights]  # omega_w; unlisted weeks = 1.0
+15 = 1.25
+16 = 1.25
+17 = 1.25
+
+[layer4]               # only used when league.horizon_years > 0
+delta = 0.85
+free_agent_mult = 0.85 # C_t when the contract ends before year t
+draft_round_mult = [1.10, 1.05, 1.0]     # rounds 1-3; later/undrafted = 0.95
+[layer4.aging]         # [peak_start, peak_end, yearly decline after peak]
+QB = [25, 33, 0.08]
+RB = [22, 26, 0.18]
+WR = [23, 29, 0.10]
+TE = [24, 30, 0.10]
+
+[layer5.sources]       # market sources and weights (z-scored, then blended)
+fantasycalc = 1.0
+
+[fantasycalc]
+numQbs = 1
+numTeams = 10
+ppr = 1
+isDynasty = false
+
+[layer6]
+alpha = 0.6            # weight on model vs market
+k = 1.3                # consolidation premium (>1 = stars worth more than 2-for-1s)
+
+[chart]
+rows = 30
+out_dir = "charts"
+
+[data]
+odds_api_env = "ODDS_API_KEY"
+cache_hours = 12       # live-season downloads; past seasons are cached forever
