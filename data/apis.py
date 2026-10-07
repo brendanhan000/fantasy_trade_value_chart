@@ -13,12 +13,12 @@ log = logging.getLogger(__name__)
 TEAM_FIX = {"LAR": "LA", "JAC": "JAX", "WSH": "WAS"}  # -> nflverse abbreviations
 
 
-def sleeper_players(hours: float) -> pd.DataFrame:
+def sleeper_players() -> pd.DataFrame:
     def fetch() -> dict:
         r = requests.get("https://api.sleeper.app/v1/players/nfl", timeout=60)
         r.raise_for_status()
         return r.json()
-    raw = cache.blob("sleeper_players", fetch, hours)
+    raw = cache.blob("sleeper_players", fetch, cache.LIVE_HOURS)
     rows = [{"sleeper_id": str(p.get("player_id")),
              "gsis_id": (p.get("gsis_id") or "").strip() or None,
              "sleeper_name": p.get("full_name"),
@@ -30,20 +30,20 @@ def sleeper_players(hours: float) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fantasycalc_values(params: dict, hours: float) -> pd.DataFrame:
+def fantasycalc_values(params: dict) -> pd.DataFrame:
     q = {k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()}
 
     def fetch() -> list:
         r = requests.get("https://api.fantasycalc.com/values/current", params=q, timeout=30)
         r.raise_for_status()
         return r.json()
-    raw = cache.blob("fantasycalc_" + "_".join(f"{k}{v}" for k, v in q.items()), fetch, hours)
+    raw = cache.blob("fantasycalc_" + "_".join(f"{k}{v}" for k, v in q.items()), fetch, cache.LIVE_HOURS)
     return pd.DataFrame([{"sleeper_id": str(x["player"].get("sleeperId")),
                           "fc_name": x["player"]["name"],
                           "fantasycalc": float(x["value"])} for x in raw])
 
 
-def odds_implied_totals(env_var: str, names: dict[str, str], hours: float) -> dict[str, float]:
+def odds_implied_totals(env_var: str, names: dict[str, str]) -> dict[str, float]:
     """Mean implied team total over upcoming games; {} when no key is set."""
     key = os.environ.get(env_var)
     if not key:
@@ -56,7 +56,7 @@ def odds_implied_totals(env_var: str, names: dict[str, str], hours: float) -> di
         r.raise_for_status()
         return r.json()
     try:
-        games = cache.blob("odds_api", fetch, hours)
+        games = cache.blob("odds_api", fetch, cache.LIVE_HOURS)
     except requests.RequestException as exc:
         log.warning("Odds API failed, environment uses neutral Vegas term: %s", exc)
         return {}

@@ -2,8 +2,7 @@
 # that you'd want to change per league.
 
 [league]
-platform = "ESPN"
-teams = 10
+teams = 10             # x [lineup] = dedicated starters (QB10 RB20 WR20 TE10 FLEX10)
 season = 0             # 0 = current nflverse season
 last_week = 17         # final fantasy week (ESPN 10-team playoffs: 15-17)
 horizon_years = 0      # T. 0 = redraft. 1+ = keeper/dynasty (enables layer 4)
@@ -46,8 +45,11 @@ rushing = [[40, 1], [50, 1.5]]
 receiving = [[40, 1], [50, 1.5]]
 
 [projection]
-recency_decay = 0.85   # weight of a game n weeks ago = decay^n
-prior_games = 4        # last season counts as at most this many games of evidence
+recency_decay = 0.9    # weight of a game n weeks ago = decay^n (fitted: calibrate.py --mode forecast)
+prior_games = 4        # last season's weight in games at week 1...
+prior_games_floor = 1  # ...fading linearly to this...
+prior_fade_week = 12   # ...by this week (keeps returning-from-injury players projectable)
+shrink_games = 10      # pseudo-games at the usage + draft-capital prediction (backtest peak 8-12)
 min_weight = 0.5       # players with less total game weight are dropped (logged)
 
 [layer1]
@@ -62,6 +64,7 @@ e_cap = 0.15
 coach_change_prior_mult = 0.5   # new head coach -> trust last season's team data less
 milestone_sigma_k = 5  # games of shrinkage toward the position's log-sd
 long_td_prior_tds = 4  # TDs of shrinkage toward the explosive-rate prior
+long_td_prior_touches = 30  # touches of shrinkage on a player's 20+ yd play rate
 
 # Reference pool per position: the OFE term is scaled to this pool's mean projection.
 [layer1.ref_pool]
@@ -149,9 +152,11 @@ availability_prior_games = 8
 sigma_prior_games = 6
 
 # Sleeper injury_status -> [play probability, number of weeks it applies]
+# Q/D/Out rates are empirical (calibrate.py --mode injuries; 2021-25 final reports, n = 2150/263/1620).
+# IR/PUP weeks are the league-rule minimum stay, not an estimate.
 [layer2.status]
-Questionable = [0.8, 1]
-Doubtful = [0.2, 1]
+Questionable = [0.64, 1]
+Doubtful = [0.0, 1]
 Out = [0.0, 1]
 Sus = [0.0, 1]
 IR = [0.0, 4]
@@ -166,14 +171,8 @@ TE = [1.0, 0.92, 0.85]
 draft_round_bonus = [0.05, 0.03, 0.01]   # rounds 1-3; r is capped at 1.0
 
 [layer3]
-flex = 10
 starter_weight = 0.5   # R = w * starter-level + (1 - w) * waiver-level
 scarcity_exp = 0.25    # S_pos = (dropoff_pos / mean dropoff)^exp; 0 disables
-[layer3.starters]
-QB = 10
-RB = 20
-WR = 20
-TE = 10
 [layer3.waiver_rank]
 QB = 15
 RB = 35
@@ -188,11 +187,11 @@ TE = 14
 delta = 0.85
 free_agent_mult = 0.85 # C_t when the contract ends before year t
 draft_round_mult = [1.10, 1.05, 1.0]     # rounds 1-3; later/undrafted = 0.95
-[layer4.aging]         # [peak_start, peak_end, yearly decline after peak]
-QB = [25, 33, 0.08]
-RB = [22, 26, 0.18]
-WR = [23, 29, 0.10]
-TE = [24, 30, 0.10]
+[layer4.aging]         # [peak_end, yearly decline after it]
+QB = [33, 0.08]
+RB = [26, 0.18]
+WR = [29, 0.10]
+TE = [30, 0.10]
 
 [layer5.sources]       # market sources and weights (z-scored, then blended)
 fantasycalc = 1.0
@@ -208,7 +207,7 @@ alpha = 0.6            # weight on model vs market
 k = 1.3                # consolidation premium (>1 = stars worth more than 2-for-1s)
 
 [chart]
-rows = 30
+band = 2               # points per row: 100-98, 98-96, ...
 out_dir = "charts"
 
 [data]

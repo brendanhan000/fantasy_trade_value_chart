@@ -19,7 +19,8 @@ os.environ.setdefault("NFLREADPY_CACHE_DIR", str(CACHE / "nflreadpy"))
 os.environ.setdefault("NFLREADPY_CACHE_DURATION", str(12 * 3600))
 os.environ.setdefault("NFLREADPY_VERBOSE", "false")
 
-REFRESH = False  # set by main.py --refresh
+REFRESH = False   # set by main.py --refresh
+LIVE_HOURS = 12.0  # set from config data.cache_hours
 
 
 def _fresh(path: Path, hours: float | None) -> bool:
@@ -28,7 +29,7 @@ def _fresh(path: Path, hours: float | None) -> bool:
     return hours is None or (time.time() - path.stat().st_mtime) < hours * 3600
 
 
-def frame(name: str, build: Callable[[], pd.DataFrame], hours: float | None) -> pd.DataFrame:
+def frame(name: str, build: Callable[[], pd.DataFrame], hours: float | None = None) -> pd.DataFrame:
     """Parquet-cached DataFrame. hours=None means never expires (past seasons)."""
     path = CACHE / f"{name}.parquet"
     if _fresh(path, hours):

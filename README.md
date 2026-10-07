@@ -2,7 +2,7 @@
 
 Rest-of-season trade values for a 10-team ESPN full-PPR league with ESPN's
 yardage and long-TD bonuses. Output is a four-column chart (QB / RB / WR / TE),
-one row per rank, each cell `Player (TEAM) — value`, scaled 0–100.
+one row per value band (`chart.band`, default 2 points: 100–98, 98–96, …), each cell listing `Player (TEAM) — value`, scaled 0–100. Players on the same row are worth about the same across positions; empty bands stay so gaps are to scale.
 
 ## Run
 
@@ -11,7 +11,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt   # or reuse .
 .venv/bin/python main.py --week 6          # value weeks 6..17 using games through week 5
 .venv/bin/python main.py --week 6 --horizon 2   # keeper/dynasty: add 2 future seasons
 .venv/bin/python main.py --refresh         # ignore cached downloads
-python -m pytest tests                     # scoring + replacement-level checks
+python tests/test_core.py                  # scoring + replacement-level checks
 ```
 
 Writes to `charts/`:
@@ -44,7 +44,7 @@ Each layer is its own module in `model/layers/`. `model/features.py` builds
 the per-player inputs.
 
 1. **Expected points** (`l1_expected.py`): `P_hat_w = [b1·Proj + b2·(O·F·E)]·SOS_w + Milestone + LongTD`.
-   - Proj is a recency-weighted per-game stat line times the scoring vector. Every per-game number is a weighted average: this season's games decay by `recency_decay`, and last season counts for at most `prior_games` games. Players with little last-season data get the gap filled with pseudo-games at the position median, so a backup's two hot games don't project as a star.
+   - Proj is a recency-weighted per-game stat line times the scoring vector. Every per-game number is a weighted average: this season's games decay by `recency_decay`, and last season counts as `prior_games` games at week 1, fading linearly to `prior_games_floor` by `prior_fade_week`. Every player is then shrunk toward a prior (at least `shrink_games` pseudo-games, more when last season is thin): an OLS prediction from snap/target/carry/air-yards share and draft round, fitted per position on established players. Usage stabilizes much faster than efficiency or TD rate, so this pulls lucky and unlucky starts toward what the role supports.
    - O·F·E is converted to points by scaling the mean Proj of the position's top `ref_pool` players. O = 1 means typical-starter usage. F and E are multipliers built from within-position (or team) z-scores, capped by `f_cap` / `e_cap`.
    - YPRR uses `snaps × team dropback rate` as routes, because free data has no route counts.
    - Milestones: per-game yards are lognormal, with the mean set to the projection and log-sd shrunk toward the position's.
@@ -72,7 +72,7 @@ Everything is in `config.toml`. The knobs that move the chart most:
 | `layer3.starter_weight`, `layer3.waiver_rank` | how deep "replacement" is. Lower means more players above 0 |
 | `layer3.week_weights` | playoff-week emphasis |
 | `layer3.scarcity_exp` | extra positional scarcity on top of VORP (0 = off) |
-| `projection.prior_games`, `recency_decay` | how fast the model believes new usage |
+| `projection.prior_games`, `prior_games_floor`, `prior_fade_week`, `recency_decay` | how fast the model believes new usage over last season |
 | `scoring.fumbles_lost`, `scoring.long_td.stack` | check these against your actual ESPN settings |
 
 To see why a player landed where they did, sort `values_detail.csv`. It has
@@ -81,10 +81,26 @@ Proj, O/F/E, the bonus terms, availability, r, σ, boom/bust, V_season, and mark
 ### Calibration (optional)
 
 ```bash
-python calibrate.py --mode market   --week 6   # fit to FantasyCalc
-python calibrate.py --mode backtest --week 6   # fit last season's week-6 values to realized ROS VORP
+python calibrate.py --mode forecast                          # recency_decay / prior_games, by one-game-ahead error
+python calibrate.py --mode injuries                          # P(plays | Questionable/Doubtful/Out), 2021-2025
+python calibrate.py --mode backtest --season 2024 2025       # b1, lambda, g1, g2, k vs realized rest-of-season VORP
+python calibrate.py --mode market   --weeks 5                # same five params vs FantasyCalc
 ```
 
-Calibration fits b1 (b2 = 1 − b1), λ, g1, g2 and k with Nelder-Mead and prints
-suggested values. It never edits the config. Backtest mode is one season at
-one week, so it's noisy. Read its output as a direction, not an answer.
+Every mode prints its suggestions and never edits the config. What's been
+established so far, and where each value came from:
+
+| value | source |
+|---|---|
+| `recency_decay = 0.9`, `prior_games = 4` | fitted by forecast error; same answer on 2024 and 2025 |
+| `shrink_games = 10` + usage/draft prior | benchmark peak at 8-12; beats the median prior in both 2024 and 2025 |
+| Questionable 0.64 / Doubtful 0.0 / Out 0.0 | empirical play rates, 2021-25 (n = 2150 / 263 / 1620) |
+| `b1`, `lambda`, `g1`, `g2`, `k` | **judgment.** Backtests on 2024 and 2025 disagree, and no setting changed ranking accuracy by more than 0.01 Spearman, so the defaults stay |
+| O/F/E weights, caps, depth-chart `r`, aging, scarcity, replacement blend, `alpha` | **judgment**, not validated |
+
+Benchmark (`--mode benchmark --season 2024 2025`; Spearman vs realized ROS
+VORP, weeks 4/6/8/10): model 0.634 overall / 0.131 top-60, points per game so
+far 0.534 / ~0.09, last season's PPG 0.419 / ~0.10. The model clearly beats
+plain PPG overall and modestly at the top of the board. Rest-of-season outcomes are dominated by injuries and role changes that
+no box-score model sees coming. FantasyCalc has no free history, so the
+market blend can't be backtested.

@@ -8,7 +8,7 @@ from model.layers import l1_expected, l2_risk, l3_vorp, l4_dynasty, l5_market, l
 
 
 def player_pool(inp: Inputs, cfg: dict) -> pd.DataFrame:
-    a = player_aggregates(inp.panel, cfg)
+    a = player_aggregates(inp.panel, cfg, inp.week, inp.meta.draft_round)
     meta = inp.meta.reindex(a.index)
     a["position"] = meta.sleeper_position.fillna(a.position)
     a["team"] = meta.sleeper_team.where(meta.sleeper_team.notna(), a.stat_team)

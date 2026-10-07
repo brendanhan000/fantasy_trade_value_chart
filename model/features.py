@@ -1,7 +1,7 @@
 """Turn raw tables into one row per player (and per team / defense).
 
 Every per-game number is a weighted average over games: this season's games
-decay by recency, last season's games count for at most `prior_games` games in
+decay by recency, last season's games count for at most `prior_games(cfg, week)` games in
 total. That single weighting is both the "recency-weighted average" and the
 "regress toward last season" step.
 """
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from data import apis
+from data import apis, cache
 from data import nflverse as nv
 from model import scoring as sc
 
@@ -23,6 +23,14 @@ POSITIONS = nv.POSITIONS
 # Minimum weighted denominators before an efficiency rate is trusted (else neutral).
 MIN_SAMPLE = {"dropbacks": 50, "carries": 20, "targets": 10, "routes": 40, "cp_n": 10}
 YARD_TYPES = ["passing_yards", "rushing_yards", "receiving_yards"]
+
+
+def prior_games(cfg: dict, week: int) -> float:
+    """Last season's total weight, in games: `prior_games` at week 1, fading linearly
+    to `prior_games_floor` by `prior_fade_week`, so 2025 matters less as 2026 accumulates."""
+    pj = cfg["projection"]
+    fade = max(0.0, 1 - (week - 1) / (pj["prior_fade_week"] - 1))
+    return pj["prior_games_floor"] + (pj["prior_games"] - pj["prior_games_floor"]) * fade
 
 
 @dataclass
@@ -40,17 +48,17 @@ class Inputs:
     missing: list[tuple[str, str]] = field(default_factory=list)
 
 
-def _panel(season: int, week: int, cfg: dict, hours: float, ppl: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _panel(season: int, week: int, cfg: dict, ppl: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     seasons = [season - 1, season]
-    stats = pd.concat([nv.player_stats(s, hours) for s in seasons], ignore_index=True)
+    stats = pd.concat([nv.player_stats(s) for s in seasons], ignore_index=True)
     stats = stats[(stats.season < season) | (stats.week < week)]
-    pbp = pd.concat([nv.pbp_player_week(s, hours) for s in seasons], ignore_index=True)
+    pbp = pd.concat([nv.pbp_player_week(s) for s in seasons], ignore_index=True)
     pfr_map = ppl.dropna(subset=["pfr_id"]).drop_duplicates("pfr_id").set_index("pfr_id").gsis_id
-    snaps = pd.concat([nv.snap_counts(s, hours) for s in seasons], ignore_index=True)
-    rush = pd.concat([nv.pfr_rushing(s, hours) for s in seasons], ignore_index=True)
+    snaps = pd.concat([nv.snap_counts(s) for s in seasons], ignore_index=True)
+    rush = pd.concat([nv.pfr_rushing(s) for s in seasons], ignore_index=True)
     for df in (snaps, rush):
         df["gsis_id"] = df.pfr_id.map(pfr_map)
-    team = pd.concat([nv.pbp_team_week(s, hours) for s in seasons], ignore_index=True)
+    team = pd.concat([nv.pbp_team_week(s) for s in seasons], ignore_index=True)
 
     key = ["season", "week", "gsis_id"]
     p = (stats.merge(pbp.drop_duplicates(key), on=key, how="left")
@@ -84,7 +92,7 @@ def _panel(season: int, week: int, cfg: dict, hours: float, ppl: pd.DataFrame) -
     cur = p.season == season
     p["w"] = np.where(cur, pj["recency_decay"] ** (week - 1 - p.week), np.nan)
     n_prev = p[~cur].groupby("gsis_id").week.transform("count")
-    p.loc[~cur, "w"] = np.minimum(1.0, pj["prior_games"] / n_prev)
+    p.loc[~cur, "w"] = np.minimum(1.0, prior_games(cfg, week) / n_prev)
     return p, team
 
 
@@ -97,7 +105,41 @@ def _wmean(p: pd.DataFrame, col: str) -> pd.Series:
     return _wsum(p[ok], col) / p.w[ok].groupby(p.gsis_id[ok]).sum()
 
 
-def player_aggregates(p: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+def _wvar(p: pd.DataFrame, x: pd.Series) -> pd.Series:
+    """Unbiased weighted variance (Kish effective-n Bessel correction); NaN under 2 effective games."""
+    g = p.gsis_id
+    sw, sw2 = p.w.groupby(g).sum(), (p.w ** 2).groupby(g).sum()
+    mean = (x * p.w).groupby(g).sum() / sw
+    raw = ((x - g.map(mean)) ** 2 * p.w).groupby(g).sum() / sw
+    n_kish = sw ** 2 / sw2
+    return (raw * n_kish / (n_kish - 1)).where(n_kish > 1.5)
+
+
+PRIOR_FEATURES = ["snap_share", "target_share", "air_yards_share", "carry_share"]
+
+
+def regression_prior(a: pd.DataFrame, col: str, pos: pd.Series, draft: pd.Series) -> np.ndarray:
+    """Prior mean for `col` from usage shares + draft round, fitted by OLS per position on
+    established players (8+ games). Usage stabilizes far faster than per-touch efficiency
+    or TD rate, so it's the most informative thing a small sample does tell us. Falls back
+    to the position median where a position has too few established players."""
+    rnd = draft.reindex(a.index)
+    X = pd.DataFrame({f: a[f].fillna(0) for f in PRIOR_FEATURES}, index=a.index)
+    for r in (1, 2, 3):
+        X[f"round_{r}"] = (rnd == r).astype(float)
+    X["intercept"] = 1.0
+    out = a[col][a.games >= 4].groupby(pos).median().reindex(pos.loc[a.index]).values.copy()
+    for p_ in pos.unique():
+        is_pos = (pos.reindex(a.index) == p_).values
+        train = is_pos & (a.games >= 8).values & a[col].notna().values
+        if train.sum() < 3 * X.shape[1]:
+            continue
+        beta, *_ = np.linalg.lstsq(X.values[train], a[col].values[train], rcond=None)
+        out[is_pos] = np.maximum(X.values[is_pos] @ beta, 0)
+    return out
+
+
+def player_aggregates(p: pd.DataFrame, cfg: dict, week: int, draft: pd.Series) -> pd.DataFrame:
     stat_cols = [c for c in cfg["scoring"] if c in p.columns]
     usage = ["snap_share", "target_share", "air_yards_share", "carry_share", "rz_touches",
              "gl_touches", "points", "boom", "bust", "attempts", "carries", "targets"]
@@ -105,13 +147,18 @@ def player_aggregates(p: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     a["n_eff"] = p.w.groupby(p.gsis_id).sum()
     a["games"] = p.groupby("gsis_id").size()
 
-    # No (or little) last season to regress toward -> fill the gap with pseudo-games
-    # at the position median, so 2 hot games from a backup don't project as a star.
+    # Empirical-Bayes shrinkage: every player gets at least `shrink_games` pseudo-games
+    # at what their usage and draft capital predict (more if last season is thin), so
+    # 2 hot games from a backup don't project as a star and TD luck washes out.
+    # Usage shares themselves shrink to the position median.
     pos = p.groupby("gsis_id").position.last()
     prev_w = p.w[p.season < p.season.max()].groupby(p.gsis_id).sum().reindex(a.index, fill_value=0)
-    m = (cfg["projection"]["prior_games"] - prev_w).clip(lower=0)
-    for col in stat_cols + usage[:6]:
-        base = a[col][a.games >= 4].groupby(pos).median().reindex(pos.loc[a.index]).values
+    m = (prior_games(cfg, week) - prev_w).clip(lower=cfg["projection"]["shrink_games"])
+    pos = pos.loc[a.index]
+    priors = {col: regression_prior(a, col, pos, draft) for col in stat_cols}
+    for col in usage[:6]:
+        priors[col] = a[col][a.games >= 4].groupby(pos).median().reindex(pos).values
+    for col, base in priors.items():
         a[col] = (a.n_eff * a[col].fillna(0) + m * base) / (a.n_eff + m)
 
     def rate(num: str, den: str, min_key: str) -> pd.Series:
@@ -126,15 +173,12 @@ def player_aggregates(p: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     a["croe"] = rate("croe_num", "cp_n", "cp_n")
 
     # Weekly points spread.
-    dev2 = (p.points - p.gsis_id.map(a.points)) ** 2
-    a["sigma"] = np.sqrt((dev2 * p.w).groupby(p.gsis_id).sum() / a.n_eff)
+    a["sigma"] = np.sqrt(_wvar(p, p.points))
 
     # Per-game yardage log-sd for the milestone lognormal (games with >= 1 yard).
     for col in YARD_TYPES:
-        q = p[p[col] >= 1].assign(ly=lambda d: np.log(d[col]))
-        m = _wmean(q, "ly")
-        var = ((q.ly - q.gsis_id.map(m)) ** 2 * q.w).groupby(q.gsis_id).sum() / q.w.groupby(q.gsis_id).sum()
-        a[f"{col}_logsd"] = np.sqrt(var)
+        q = p[p[col] >= 1]
+        a[f"{col}_logsd"] = np.sqrt(_wvar(q, np.log(q[col])))
         a[f"{col}_n"] = q.groupby("gsis_id").size()
 
     # Long-TD evidence.
@@ -143,7 +187,8 @@ def player_aggregates(p: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         a[f"{prefix}_n"] = _wsum(p, td)
         for t, _ in cfg["scoring"]["long_td"]["rushing" if prefix == "rush_td" else "receiving"]:
             a[f"{prefix}_{int(t)}"] = _wsum(p, f"{prefix}_{int(t)}")
-        a[f"{prefix}_explosive"] = _wsum(p, expl) / _wsum(p, vol)
+        a[f"{prefix}_vol"] = _wsum(p, vol)
+        a[f"{prefix}_explosive"] = _wsum(p, expl) / a[f"{prefix}_vol"]
 
     last = p.sort_values(["season", "week"]).groupby("gsis_id").last()
     a["name"], a["stat_team"], a["position"] = last.name, last.team, last.position
@@ -161,7 +206,7 @@ def team_environment(team: pd.DataFrame, sched: pd.DataFrame, season: int, week:
 
     t = team[(team.season < season) | (team.week < week)].copy()
     cur = t.season == season
-    prior_w = min(1.0, pj["prior_games"] / 17)
+    prior_w = min(1.0, prior_games(cfg, week) / 17)
     t["w"] = np.where(cur, pj["recency_decay"] ** (week - 1 - t.week), prior_w)
     t.loc[~cur, "w"] *= t.loc[~cur, "team"].map(
         lambda x: cfg["layer1"]["coach_change_prior_mult"] if changed.get(x) else 1.0)
@@ -189,7 +234,6 @@ def team_environment(team: pd.DataFrame, sched: pd.DataFrame, season: int, week:
                              pd.Series(away.values, up.away_team.values)]).groupby(level=0).mean().to_dict()
     it = pd.Series(implied, dtype=float).reindex(out.index)
     out["implied_total"] = z(it).fillna(0.0) if it.notna().sum() > 2 else 0.0
-    out["coach_change"] = out.index.map(lambda x: bool(changed.get(x)))
     return out.fillna(0.0)
 
 
@@ -198,7 +242,7 @@ def defense_ratio(p: pd.DataFrame, season: int, week: int, cfg: dict) -> pd.Data
     pj, k = cfg["projection"], cfg["layer1"]["sos_prior_games"]
     g = p.groupby(["season", "week", "opponent_team", "position"]).points.sum().reset_index()
     cur = g.season == season
-    g["w"] = np.where(cur, pj["recency_decay"] ** (week - 1 - g.week), min(1.0, pj["prior_games"] / 17))
+    g["w"] = np.where(cur, pj["recency_decay"] ** (week - 1 - g.week), min(1.0, prior_games(cfg, week) / 17))
     g["wp"] = g.points * g.w
     s = g.groupby(["opponent_team", "position"])[["wp", "w"]].sum()
     allowed = s.wp / s.w
@@ -208,13 +252,13 @@ def defense_ratio(p: pd.DataFrame, season: int, week: int, cfg: dict) -> pd.Data
 
 
 def load_inputs(cfg: dict, season: int, week: int) -> Inputs:
-    hours = cfg["data"]["cache_hours"]
+    cache.LIVE_HOURS = cfg["data"]["cache_hours"]
     ppl = nv.players()
-    panel, team = _panel(season, week, cfg, hours, ppl)
-    sched = nv.schedules([season - 1, season], hours)
+    panel, team = _panel(season, week, cfg, ppl)
+    sched = nv.schedules([season - 1, season])
     weeks = list(range(week, cfg["league"]["last_week"] + 1))
 
-    implied = apis.odds_implied_totals(cfg["data"]["odds_api_env"], nv.team_names(), hours)
+    implied = apis.odds_implied_totals(cfg["data"]["odds_api_env"], nv.team_names())
     team_env = team_environment(team, sched, season, week, cfg, implied)
     def_ratio = defense_ratio(panel, season, week, cfg)
 
@@ -227,9 +271,9 @@ def load_inputs(cfg: dict, season: int, week: int) -> Inputs:
     team_games = {(season, t): int(((played.home_team == t) | (played.away_team == t)).sum())
                   for t in opponents.index}
 
-    sl = apis.sleeper_players(hours)
+    sl = apis.sleeper_players()
     sl["gsis_id"] = sl.sleeper_id.map(nv.sleeper_to_gsis()).fillna(sl.gsis_id)
-    fc = apis.fantasycalc_values(cfg["fantasycalc"], hours)
+    fc = apis.fantasycalc_values(cfg["fantasycalc"])
     market = fc.merge(sl[["sleeper_id", "gsis_id"]], on="sleeper_id", how="left")
     missing = [(r.fc_name, "FantasyCalc player has no gsis_id mapping; dropped")
                for r in market[market.gsis_id.isna()].itertuples()]
@@ -239,7 +283,7 @@ def load_inputs(cfg: dict, season: int, week: int) -> Inputs:
                .join(sl.dropna(subset=["gsis_id"]).drop_duplicates("gsis_id").set_index("gsis_id")))
     meta["age"] = ((pd.Timestamp(f"{season}-09-01") - pd.to_datetime(meta.birth_date, errors="coerce"))
                    .dt.days / 365.25).fillna(meta.sleeper_age)
-    meta = meta.join(nv.depth_ranks(season, hours).set_index("gsis_id"))
+    meta = meta.join(nv.depth_ranks(season).set_index("gsis_id"))
     if cfg["league"]["horizon_years"] > 0:
         meta = meta.join(nv.contract_end_year().set_index("gsis_id"))
 

@@ -8,7 +8,7 @@ import pandas as pd
 
 
 def aging(pos: str, age: float, curves: dict) -> float:
-    start, end, decline = curves[pos]
+    end, decline = curves[pos]
     if pd.isna(age) or age <= end:
         return 1.0
     return max(0.0, 1 - decline * (age - end))

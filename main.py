@@ -19,7 +19,7 @@ def load_config(path: Path) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--week", type=int, help="first week to value (default: next week to be played)")
+    ap.add_argument("--week", type=int, help="first week to value (default: the upcoming week)")
     ap.add_argument("--season", type=int, help="default: config league.season, else current")
     ap.add_argument("--config", type=Path, default=ROOT / "config.toml")
     ap.add_argument("--horizon", type=int, help="override league.horizon_years (T)")
@@ -37,15 +37,18 @@ def main() -> None:
     if args.horizon is not None:
         cfg["league"]["horizon_years"] = args.horizon
     season = args.season or cfg["league"]["season"] or nv.current_season()
-    week = args.week or nv.nfl.get_current_week() + 1
+    week = args.week or nv.nfl.get_current_week()
     log.info("valuing %d weeks %d-%d", season, week, cfg["league"]["last_week"])
+    if (season, week) < (nv.current_season(), nv.nfl.get_current_week()):
+        log.warning("week %d is in the past: stats are cut off correctly, but FantasyCalc values, "
+                    "Sleeper injury tags and depth charts are TODAY's, not as of week %d", week, week)
 
     inp = load_inputs(cfg, season, week)
     values = run_model(inp, cfg)
 
     out_dir = ROOT / cfg["chart"]["out_dir"]
     title = f"Trade Value Chart — {season} Week {week}"
-    for p in export(values, out_dir, cfg["chart"]["rows"], title):
+    for p in export(values, out_dir, cfg["chart"]["band"], title):
         log.info("wrote %s", p.relative_to(ROOT))
 
     miss = out_dir / "missing_data.log"

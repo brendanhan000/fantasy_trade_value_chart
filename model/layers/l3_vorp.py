@@ -10,22 +10,28 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+POSITIONS = ["QB", "RB", "WR", "TE"]
+
+
+def starters(cfg: dict) -> dict[str, int]:
+    return {p: cfg["lineup"][p] * cfg["league"]["teams"] for p in POSITIONS}
+
 
 def replacement_levels(pts: pd.Series, pos: pd.Series, cfg: dict) -> dict[str, float]:
     """One week: dedicated starters, then FLEX from the rest, then next man up per position."""
     l3, flex_pos = cfg["layer3"], cfg["lineup"]["flex_eligible"]
     order = pts.sort_values(ascending=False)
     pos = pos.reindex(order.index)
-    used = {p: n for p, n in l3["starters"].items()}
+    used = starters(cfg)
     taken = pd.Series(False, index=order.index)
     for p, n in used.items():
         taken[pos[pos == p].index[:n]] = True
-    for gid in order.index[~taken.values & pos.isin(flex_pos).values][:l3["flex"]]:
+    for gid in order.index[~taken.values & pos.isin(flex_pos).values][:cfg["lineup"]["FLEX"] * cfg["league"]["teams"]]:
         taken[gid] = True
         used[pos[gid]] += 1
 
     out = {}
-    for p in l3["starters"]:
+    for p in POSITIONS:
         ranked = order[pos == p]
         starter = ranked.iloc[min(used[p], len(ranked) - 1)]
         waiver = ranked.iloc[min(l3["waiver_rank"][p] - 1, len(ranked) - 1)]
@@ -37,7 +43,7 @@ def scarcity(mean_pts: pd.Series, pos: pd.Series, cfg: dict) -> dict[str, float]
     """Points lost per rank across each position's dedicated starters, relative to the average."""
     l3 = cfg["layer3"]
     slope = {}
-    for p, n in l3["starters"].items():
+    for p, n in starters(cfg).items():
         top = mean_pts[pos == p].nlargest(n).values
         slope[p] = -np.polyfit(np.arange(len(top)), top, 1)[0] if len(top) > 1 else 0.0
     mean_slope = np.mean(list(slope.values()))

@@ -19,7 +19,7 @@ def _z(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / sd if sd and sd > 0 else s * 0
 
 
-def _blend(df: pd.DataFrame, weights: dict[str, float], absolute: bool) -> pd.Series:
+def _blend(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
     """Weighted mean of available (non-NaN) columns; missing ones drop out of the denominator."""
     num = pd.Series(0.0, index=df.index)
     den = pd.Series(0.0, index=df.index)
@@ -28,12 +28,8 @@ def _blend(df: pd.DataFrame, weights: dict[str, float], absolute: bool) -> pd.Se
             continue
         ok = df[col].notna()
         num += df[col].fillna(0) * w
-        den += ok * (abs(w) if absolute else w)
+        den += ok * abs(w)
     return (num / den.replace(0, np.nan)).fillna(0.0)
-
-
-def stat_projection(a: pd.DataFrame, scoring: dict) -> pd.Series:
-    return sc.base_points(a, scoring)
 
 
 def milestone_bonus(a: pd.DataFrame, scoring: dict, k: float) -> pd.Series:
@@ -47,16 +43,20 @@ def milestone_bonus(a: pd.DataFrame, scoring: dict, k: float) -> pd.Series:
     return total
 
 
-def long_td_bonus(a: pd.DataFrame, scoring: dict, k: float) -> pd.Series:
+def long_td_bonus(a: pd.DataFrame, scoring: dict, k: float, touches: float) -> pd.Series:
     cfg = scoring["long_td"]
     total = pd.Series(0.0, index=a.index)
     for kind, prefix, td_col in (("rushing", "rush_td", "rushing_tds"),
                                  ("receiving", "rec_td", "receiving_tds")):
         tiers = cfg[kind]
         n_td = a[f"{prefix}_n"].fillna(0)
-        expl = a[f"{prefix}_explosive"]
-        pos_expl = expl.groupby(a.position).transform("median")
-        tilt = (expl / pos_expl).clip(0.5, 2.0).fillna(1.0)
+        # Tilt = player's 20+ yd play rate vs the position's pooled rate. Pooled, not
+        # median: most backups have zero big plays, which drags the median to ~0.
+        vol = a[f"{prefix}_vol"].fillna(0)
+        big = a[f"{prefix}_explosive"].fillna(0) * vol
+        pooled = big.groupby(a.position).transform("sum") / vol.groupby(a.position).transform("sum")
+        rate = (big + touches * pooled) / (vol + touches)  # small samples lean on the position
+        tilt = (rate / pooled).clip(0.5, 2.0).fillna(1.0)
         pis = []
         for t, _ in tiers:
             hits = a[f"{prefix}_{int(t)}"].fillna(0)
@@ -75,7 +75,7 @@ def expected_points(a: pd.DataFrame, team_env: pd.DataFrame, def_ratio: pd.DataF
     """Returns (P_hat by week [players x weeks], component table)."""
     l1, scoring = cfg["layer1"], cfg["scoring"]
     c = pd.DataFrame(index=a.index)
-    c["proj"] = stat_projection(a, scoring)
+    c["proj"] = sc.base_points(a, scoring)
 
     O, F, E, ref = (pd.Series(np.nan, index=a.index) for _ in range(4))
     env = team_env.reindex(a.team).set_index(a.index)
@@ -84,16 +84,16 @@ def expected_points(a: pd.DataFrame, team_env: pd.DataFrame, def_ratio: pd.DataF
         pool = c.proj[idx].nlargest(l1["ref_pool"][pos]).index
         ow = l1["opportunity"][pos]
         ratios = pd.DataFrame({k: g[k] / g.loc[pool, k].mean() for k in ow})
-        O[idx] = _blend(ratios, ow, absolute=False)
+        O[idx] = _blend(ratios, ow)
         fz = pd.DataFrame({k: _z(g[k]) for k in l1["efficiency"][pos]})
-        F[idx] = 1 + (l1["f_scale"] * _blend(fz, l1["efficiency"][pos], True)).clip(-l1["f_cap"], l1["f_cap"])
-        E[idx] = 1 + (l1["e_scale"] * _blend(env.loc[idx], l1["environment"][pos], True)).clip(-l1["e_cap"], l1["e_cap"])
+        F[idx] = 1 + (l1["f_scale"] * _blend(fz, l1["efficiency"][pos])).clip(-l1["f_cap"], l1["f_cap"])
+        E[idx] = 1 + (l1["e_scale"] * _blend(env.loc[idx], l1["environment"][pos])).clip(-l1["e_cap"], l1["e_cap"])
         ref[idx] = c.proj[pool].mean()
     c["O"], c["F"], c["E"] = O, F, E
     c["ofe_pts"] = ref * O * F * E
     c["core"] = l1["b1"] * c.proj + l1["b2"] * c.ofe_pts
     c["milestone"] = milestone_bonus(a, scoring, l1["milestone_sigma_k"])
-    c["long_td"] = long_td_bonus(a, scoring, l1["long_td_prior_tds"])
+    c["long_td"] = long_td_bonus(a, scoring, l1["long_td_prior_tds"], l1["long_td_prior_touches"])
 
     opp = opponents.reindex(a.team).set_index(a.index)
     sos = pd.DataFrame(index=a.index, columns=opponents.columns, dtype=float)

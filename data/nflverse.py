@@ -22,8 +22,8 @@ def current_season() -> int:
     return nfl.get_current_season()
 
 
-def _hours(season: int, live_hours: float) -> float | None:
-    return None if season < current_season() else live_hours
+def _hours(season: int) -> float | None:
+    return None if season < current_season() else cache.LIVE_HOURS
 
 
 def _reg(df: pl.DataFrame) -> pl.DataFrame:
@@ -54,7 +54,7 @@ STAT_COLS = [
 ]
 
 
-def player_stats(season: int, hours: float) -> pd.DataFrame:
+def player_stats(season: int) -> pd.DataFrame:
     def build() -> pd.DataFrame:
         df = _reg(_safe(nfl.load_player_stats, [season]))
         if df.is_empty():
@@ -67,7 +67,7 @@ def player_stats(season: int, hours: float) -> pd.DataFrame:
               if c in out]
         out["fumbles_lost"] = out[fl].fillna(0).sum(axis=1)
         return out
-    return cache.frame(f"stats_{season}", build, _hours(season, hours))
+    return cache.frame(f"stats_{season}", build, _hours(season))
 
 
 def _pbp(season: int) -> pl.DataFrame:
@@ -77,7 +77,7 @@ def _pbp(season: int) -> pl.DataFrame:
     return p.filter(pl.col("play_type").is_in(["pass", "run"]))
 
 
-def pbp_player_week(season: int, hours: float) -> pd.DataFrame:
+def pbp_player_week(season: int) -> pd.DataFrame:
     """Red-zone/goal-line usage, completion-over-expected, long TDs, dropbacks."""
     def build() -> pd.DataFrame:
         p = _pbp(season)
@@ -106,10 +106,10 @@ def pbp_player_week(season: int, hours: float) -> pd.DataFrame:
         out = out.join(drop, on=["week", "gsis_id"], how="full", coalesce=True)
         out = out.with_columns(pl.lit(season).alias("season")).to_pandas()
         return out.fillna(0)
-    return cache.frame(f"pbp_player_{season}", build, _hours(season, hours))
+    return cache.frame(f"pbp_player_{season}", build, _hours(season))
 
 
-def pbp_team_week(season: int, hours: float) -> pd.DataFrame:
+def pbp_team_week(season: int) -> pd.DataFrame:
     """Team environment: neutral PROE, pace, QB EPA/dropback, sack and stuff rates."""
     def build() -> pd.DataFrame:
         p = _pbp(season)
@@ -129,18 +129,18 @@ def pbp_team_week(season: int, hours: float) -> pd.DataFrame:
                      stuffs=(designed_run & (pl.col("yards_gained") <= 0)).sum(),
                      qb_epa=pl.col("qb_epa").filter(db).sum()))
         return out.with_columns(pl.lit(season).alias("season")).to_pandas()
-    return cache.frame(f"pbp_team_{season}", build, _hours(season, hours))
+    return cache.frame(f"pbp_team_{season}", build, _hours(season))
 
 
 def players() -> pd.DataFrame:
     def build() -> pd.DataFrame:
         cols = ["gsis_id", "display_name", "position", "birth_date", "pfr_id",
-                "draft_round", "draft_pick", "rookie_season", "latest_team"]
+                "draft_round"]
         return nfl.load_players().select(cols).to_pandas()
     return cache.frame("players", build, 24 * 7)
 
 
-def snap_counts(season: int, hours: float) -> pd.DataFrame:
+def snap_counts(season: int) -> pd.DataFrame:
     def build() -> pd.DataFrame:
         df = _reg(_safe(nfl.load_snap_counts, [season]))
         if df.is_empty():
@@ -148,10 +148,10 @@ def snap_counts(season: int, hours: float) -> pd.DataFrame:
         return (df.select("season", "week", pl.col("pfr_player_id").alias("pfr_id"),
                           "offense_snaps", pl.col("offense_pct").alias("snap_share"))
                   .to_pandas())
-    return cache.frame(f"snaps_{season}", build, _hours(season, hours))
+    return cache.frame(f"snaps_{season}", build, _hours(season))
 
 
-def pfr_rushing(season: int, hours: float) -> pd.DataFrame:
+def pfr_rushing(season: int) -> pd.DataFrame:
     def build() -> pd.DataFrame:
         df = _reg(_safe(nfl.load_pfr_advstats, [season], stat_type="rush", summary_level="week"))
         if df.is_empty():
@@ -159,27 +159,32 @@ def pfr_rushing(season: int, hours: float) -> pd.DataFrame:
         return (df.select("season", "week", pl.col("pfr_player_id").alias("pfr_id"),
                           pl.col("rushing_yards_after_contact").alias("yards_after_contact"))
                   .to_pandas())
-    return cache.frame(f"pfr_rush_{season}", build, _hours(season, hours))
+    return cache.frame(f"pfr_rush_{season}", build, _hours(season))
 
 
-def schedules(seasons: list[int], hours: float) -> pd.DataFrame:
+def schedules(seasons: list[int]) -> pd.DataFrame:
     def build() -> pd.DataFrame:
         cols = ["season", "week", "home_team", "away_team", "spread_line", "total_line",
-                "home_coach", "away_coach", "home_score"]
+                "home_coach", "away_coach"]
         return _reg(nfl.load_schedules(seasons)).select(cols).to_pandas()
-    return cache.frame(f"schedules_{'_'.join(map(str, seasons))}", build, hours)
+    return cache.frame(f"schedules_{'_'.join(map(str, seasons))}", build, cache.LIVE_HOURS)
 
 
-def depth_ranks(season: int, hours: float) -> pd.DataFrame:
+def depth_ranks(season: int) -> pd.DataFrame:
     """Latest depth-chart rank per player (1 = first string)."""
     def build() -> pd.DataFrame:
         df = _safe(nfl.load_depth_charts, [season])
         if df.is_empty():
             return pd.DataFrame(columns=["gsis_id", "depth_rank"])
-        df = df.filter(pl.col("pos_abb").is_in(POSITIONS) & pl.col("gsis_id").is_not_null())
-        df = df.filter(pl.col("dt") == pl.col("dt").max().over("team"))
+        if "pos_abb" in df.columns:  # 2025+: daily ESPN snapshots
+            df = df.filter(pl.col("pos_abb").is_in(POSITIONS) & pl.col("gsis_id").is_not_null())
+            df = df.filter(pl.col("dt") == pl.col("dt").max().over("team"))
+        else:                        # <= 2024: weekly charts with depth_team "1", "2", ...
+            df = _reg(df).filter(pl.col("position").is_in(POSITIONS) & pl.col("gsis_id").is_not_null())
+            df = df.filter(pl.col("week") == pl.col("week").max().over("club_code")).with_columns(
+                pos_rank=pl.col("depth_team").cast(pl.Int32, strict=False))
         return (df.group_by("gsis_id").agg(depth_rank=pl.col("pos_rank").min()).to_pandas())
-    return cache.frame(f"depth_{season}", build, hours)
+    return cache.frame(f"depth_{season}", build, cache.LIVE_HOURS)
 
 
 def contract_end_year() -> pd.DataFrame:
